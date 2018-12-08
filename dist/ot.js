@@ -1,9 +1,9 @@
 /*
  *    /\
- *   /  \ ot 0.0.14
+ *   /  \ ot 0.0.18
  *  /    \ http://operational-transformation.github.com
  *  \    /
- *   \  / (c) 2012-2014 Tim Baumann <tim@timbaumann.info> (http://timbaumann.info)
+ *   \  / (c) 2012-2018 Tim Baumann <tim@timbaumann.info> (http://timbaumann.info), Max Wu <jackymaxj@gmail.com>
  *    \/ ot may be freely distributed under the MIT license.
  */
 
@@ -859,7 +859,7 @@ ot.Client = (function (global) {
   // Client constructor
   function Client (revision) {
     this.revision = revision; // the next expected revision number
-    this.state = synchronized_; // start state
+    this.setState(synchronized_); // start state
   }
 
   Client.prototype.setState = function (state) {
@@ -872,16 +872,18 @@ ot.Client = (function (global) {
   };
 
   // Call this method with a new operation from the server
-  Client.prototype.applyServer = function (operation) {
-    this.revision++;
-    this.setState(this.state.applyServer(this, operation));
+  Client.prototype.applyServer = function (revision, operation) {
+    this.setState(this.state.applyServer(this, revision, operation));
   };
 
-  Client.prototype.serverAck = function () {
-    this.revision++;
-    this.setState(this.state.serverAck(this));
+  Client.prototype.applyOperations = function (head, operations) {
+    this.setState(this.state.applyOperations(this, head, operations));
   };
-  
+
+  Client.prototype.serverAck = function (revision) {
+    this.setState(this.state.serverAck(this, revision));
+  };
+
   Client.prototype.serverReconnect = function () {
     if (typeof this.state.resend === 'function') { this.state.resend(this); }
   };
@@ -919,14 +921,18 @@ ot.Client = (function (global) {
     return new AwaitingConfirm(operation);
   };
 
-  Synchronized.prototype.applyServer = function (client, operation) {
+  Synchronized.prototype.applyServer = function (client, revision, operation) {
+    if (revision - client.revision > 1) {
+      throw new Error("Invalid revision.");
+    }
+    client.revision = revision;
     // When we receive a new operation from the server, the operation can be
     // simply applied to the current document
     client.applyOperation(operation);
     return this;
   };
 
-  Synchronized.prototype.serverAck = function (client) {
+  Synchronized.prototype.serverAck = function (client, revision) {
     throw new Error("There is no pending operation.");
   };
 
@@ -951,7 +957,11 @@ ot.Client = (function (global) {
     return new AwaitingWithBuffer(this.outstanding, operation);
   };
 
-  AwaitingConfirm.prototype.applyServer = function (client, operation) {
+  AwaitingConfirm.prototype.applyServer = function (client, revision, operation) {
+    if (revision - client.revision > 1) {
+      throw new Error("Invalid revision.");
+    }
+    client.revision = revision;
     // This is another client's operation. Visualization:
     //
     //                   /\
@@ -967,7 +977,11 @@ ot.Client = (function (global) {
     return new AwaitingConfirm(pair[0]);
   };
 
-  AwaitingConfirm.prototype.serverAck = function (client) {
+  AwaitingConfirm.prototype.serverAck = function (client, revision) {
+    if (revision - client.revision > 1) {
+      return new Stale(this.outstanding, client, revision).getOperations();
+    }
+    client.revision = revision;
     // The client's operation has been acknowledged
     // => switch to synchronized state
     return synchronized_;
@@ -999,7 +1013,11 @@ ot.Client = (function (global) {
     return new AwaitingWithBuffer(this.outstanding, newBuffer);
   };
 
-  AwaitingWithBuffer.prototype.applyServer = function (client, operation) {
+  AwaitingWithBuffer.prototype.applyServer = function (client, revision, operation) {
+    if (revision - client.revision > 1) {
+      throw new Error("Invalid revision.");
+    }
+    client.revision = revision;
     // Operation comes from another client
     //
     //                       /\
@@ -1024,7 +1042,11 @@ ot.Client = (function (global) {
     return new AwaitingWithBuffer(pair1[0], pair2[0]);
   };
 
-  AwaitingWithBuffer.prototype.serverAck = function (client) {
+  AwaitingWithBuffer.prototype.serverAck = function (client, revision) {
+    if (revision - client.revision > 1) {
+      return new StaleWithBuffer(this.outstanding, this.buffer, client, revision).getOperations();
+    }
+    client.revision = revision;
     // The pending operation has been acknowledged
     // => send buffer
     client.sendOperation(client.revision, this.buffer);
@@ -1042,6 +1064,93 @@ ot.Client = (function (global) {
   };
 
 
+  function Stale(acknowlaged, client, revision) {
+    this.acknowlaged = acknowlaged;
+    this.client = client;
+    this.revision = revision;
+  }
+  Client.Stale = Stale;
+
+  Stale.prototype.applyClient = function (client, operation) {
+    return new StaleWithBuffer(this.acknowlaged, operation, client, this.revision);
+  };
+
+  Stale.prototype.applyServer = function (client, revision, operation) {
+    throw new Error("Ignored server-side change.");
+  };
+
+  Stale.prototype.applyOperations = function (client, head, operations) {
+    var transform = this.acknowlaged.constructor.transform;
+    for (var i = 0; i < operations.length; i++) {
+      var op = ot.TextOperation.fromJSON(operations[i]);
+      var pair = transform(this.acknowlaged, op);
+      client.applyOperation(pair[1]);
+      this.acknowlaged = pair[0];
+    }
+    client.revision = this.revision;
+    return synchronized_;
+  };
+
+  Stale.prototype.serverAck = function (client, revision) {
+    throw new Error("There is no pending operation.");
+  };
+
+  Stale.prototype.transformSelection = function (selection) {
+    return selection;
+  };
+
+  Stale.prototype.getOperations = function () {
+    this.client.getOperations(this.client.revision, this.revision - 1); // acknowlaged is the one at revision
+    return this;
+  };
+
+
+  function StaleWithBuffer(acknowlaged, buffer, client, revision) {
+    this.acknowlaged = acknowlaged;
+    this.buffer = buffer;
+    this.client = client;
+    this.revision = revision;
+  }
+  Client.StaleWithBuffer = StaleWithBuffer;
+
+  StaleWithBuffer.prototype.applyClient = function (client, operation) {
+    var buffer = this.buffer.compose(operation);
+    return new StaleWithBuffer(this.acknowlaged, buffer, client, this.revision);
+  };
+
+  StaleWithBuffer.prototype.applyServer = function (client, revision, operation) {
+    throw new Error("Ignored server-side change.");
+  };
+
+  StaleWithBuffer.prototype.applyOperations = function (client, head, operations) {
+    var transform = this.acknowlaged.constructor.transform;
+    for (var i = 0; i < operations.length; i++) {
+      var op = ot.TextOperation.fromJSON(operations[i]);
+      var pair1 = transform(this.acknowlaged, op);
+      var pair2 = transform(this.buffer, pair1[1]);
+      client.applyOperation(pair2[1]);
+      this.acknowlaged = pair1[0];
+      this.buffer = pair2[0];
+    }
+    client.revision = this.revision;
+    client.sendOperation(client.revision, this.buffer);
+    return new AwaitingConfirm(this.buffer);
+  };
+
+  StaleWithBuffer.prototype.serverAck = function (client, revision) {
+    throw new Error("There is no pending operation.");
+  };
+
+  StaleWithBuffer.prototype.transformSelection = function (selection) {
+    return selection;
+  };
+
+  StaleWithBuffer.prototype.getOperations = function () {
+    this.client.getOperations(this.client.revision, this.revision - 1); // acknowlaged is the one at revision
+    return this;
+  };
+
+
   return Client;
 
 }(this));
@@ -1049,6 +1158,7 @@ ot.Client = (function (global) {
 if (typeof module === 'object') {
   module.exports = ot.Client;
 }
+
 
 /*global ot */
 
@@ -1200,12 +1310,17 @@ ot.CodeMirrorAdapter = (function (global) {
         if (TextOperation.isRetain(op)) {
           index += op;
         } else if (TextOperation.isInsert(op)) {
-          cm.replaceRange(op, cm.posFromIndex(index));
+          var position = cm.getCursor();
+          var indexPos = cm.posFromIndex(index);
+          cm.replaceRange(op, indexPos, null, 'ignoreHistory');
+          if (position.line === indexPos.line && position.ch === indexPos.ch) {
+            cm.setCursor(position);
+          }
           index += op.length;
         } else if (TextOperation.isDelete(op)) {
           var from = cm.posFromIndex(index);
           var to   = cm.posFromIndex(index - op);
-          cm.replaceRange('', from, to);
+          cm.replaceRange('', from, to, 'ignoreHistory');
         }
       }
     });
@@ -1269,7 +1384,7 @@ ot.CodeMirrorAdapter = (function (global) {
 
   CodeMirrorAdapter.prototype.setSelection = function (selection) {
     var ranges = [];
-    for (var i = 0; i < selection.ranges.length; i++) {
+    for (var i = 0; selection && i < selection.ranges.length; i++) {
       var range = selection.ranges[i];
       ranges[i] = {
         anchor: this.cm.posFromIndex(range.anchor),
@@ -1297,7 +1412,8 @@ ot.CodeMirrorAdapter = (function (global) {
     var cursorCoords = this.cm.cursorCoords(cursorPos);
     var cursorEl = document.createElement('span');
     cursorEl.className = 'other-client';
-    cursorEl.style.display = 'inline-block';
+    cursorEl.style.display = 'none';
+    /*
     cursorEl.style.padding = '0';
     cursorEl.style.marginLeft = cursorEl.style.marginRight = '-1px';
     cursorEl.style.borderLeftWidth = '2px';
@@ -1305,6 +1421,7 @@ ot.CodeMirrorAdapter = (function (global) {
     cursorEl.style.borderLeftColor = color;
     cursorEl.style.height = (cursorCoords.bottom - cursorCoords.top) * 0.9 + 'px';
     cursorEl.style.zIndex = 0;
+    */
     cursorEl.setAttribute('data-clientid', clientId);
     return this.cm.setBookmark(cursorPos, { widget: cursorEl, insertLeft: true });
   };
@@ -1313,7 +1430,8 @@ ot.CodeMirrorAdapter = (function (global) {
     var match = /^#([0-9a-fA-F]{6})$/.exec(color);
     if (!match) { throw new Error("only six-digit hex colors are allowed."); }
     var selectionClassName = 'selection-' + match[1];
-    var rule = '.' + selectionClassName + ' { background: ' + color + '; }';
+    var rgbcolor = hex2rgb(color);
+    var rule = '.' + selectionClassName + ' { background: rgba(' + rgbcolor.red + ',' + rgbcolor.green + ',' + rgbcolor.blue + ',0.2); }';
     addStyleRule(rule);
 
     var anchorPos = this.cm.posFromIndex(range.anchor);
@@ -1331,7 +1449,7 @@ ot.CodeMirrorAdapter = (function (global) {
     for (var i = 0; i < selection.ranges.length; i++) {
       var range = selection.ranges[i];
       if (range.isEmpty()) {
-        selectionObjects[i] = this.setOtherCursor(range.head, color, clientId);
+        //selectionObjects[i] = this.setOtherCursor(range.head, color, clientId);
       } else {
         selectionObjects[i] = this.setOtherSelectionRange(range, color, clientId);
       }
@@ -1339,7 +1457,7 @@ ot.CodeMirrorAdapter = (function (global) {
     return {
       clear: function () {
         for (var i = 0; i < selectionObjects.length; i++) {
-          selectionObjects[i].clear();
+          if (selectionObjects[i]) { selectionObjects[i].clear(); }
         }
       }
     };
@@ -1352,7 +1470,9 @@ ot.CodeMirrorAdapter = (function (global) {
   };
 
   CodeMirrorAdapter.prototype.applyOperation = function (operation) {
-    this.ignoreNextChange = true;
+    if (!operation.isNoop()) {
+      this.ignoreNextChange = true;
+    }
     CodeMirrorAdapter.applyOperationToCodeMirror(operation, this.cm);
   };
 
@@ -1381,6 +1501,22 @@ ot.CodeMirrorAdapter = (function (global) {
     };
   }
 
+  function hex2rgb(hex) {
+    if (hex[0] === "#") { hex = hex.substr(1); }
+    if (hex.length === 3) {
+      var temp = hex;
+      hex = '';
+      temp = /^([a-f0-9])([a-f0-9])([a-f0-9])$/i.exec(temp).slice(1);
+      for (var i = 0; i < 3; i++) { hex += temp[i] + temp[i]; }
+    }
+    var triplets = /^([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})$/i.exec(hex).slice(1);
+    return {
+      red: parseInt(triplets[0], 16),
+      green: parseInt(triplets[1], 16),
+      blue: parseInt(triplets[2], 16)
+    };
+  }
+
   return CodeMirrorAdapter;
 
 }(this));
@@ -1401,10 +1537,18 @@ ot.SocketIOAdapter = (function () {
       .on('set_name', function (clientId, name) {
         self.trigger('set_name', clientId, name);
       })
-      .on('ack', function () { self.trigger('ack'); })
-      .on('operation', function (clientId, operation, selection) {
-        self.trigger('operation', operation);
+      .on('set_color', function (clientId, color) {
+        self.trigger('set_color', clientId, color);
+      })
+      .on('ack', function (revision) {
+        self.trigger('ack', revision);
+      })
+      .on('operation', function (clientId, revision, operation, selection) {
+        self.trigger('operation', revision, operation);
         self.trigger('selection', clientId, selection);
+      })
+      .on('operations', function (head, operations) {
+        self.trigger('operations', head, operations);
       })
       .on('selection', function (clientId, selection) {
         self.trigger('selection', clientId, selection);
@@ -1422,6 +1566,10 @@ ot.SocketIOAdapter = (function () {
     this.socket.emit('selection', selection);
   };
 
+  SocketIOAdapter.prototype.getOperations = function (base, head) {
+    this.socket.emit('get_operations', base, head);
+  };
+
   SocketIOAdapter.prototype.registerCallbacks = function (cb) {
     this.callbacks = cb;
   };
@@ -1435,6 +1583,7 @@ ot.SocketIOAdapter = (function () {
   return SocketIOAdapter;
 
 }());
+
 /*global ot, $ */
 
 ot.AjaxAdapter = (function () {
@@ -1578,8 +1727,8 @@ ot.EditorClient = (function () {
 
   SelfMeta.prototype.transform = function (operation) {
     return new SelfMeta(
-      this.selectionBefore.transform(operation),
-      this.selectionAfter.transform(operation)
+      (this.selectionBefore ? this.selectionBefore.transform(operation) : null),
+      (this.selectionAfter ? this.selectionAfter.transform(operation) : null)
     );
   };
 
@@ -1604,19 +1753,24 @@ ot.EditorClient = (function () {
   };
 
 
-  function OtherClient (id, listEl, editorAdapter, name, selection) {
+  function OtherClient (id, listEl, editorAdapter, name, color, selection) {
     this.id = id;
     this.listEl = listEl;
     this.editorAdapter = editorAdapter;
     this.name = name;
+    this.color = color;
 
     this.li = document.createElement('li');
     if (name) {
       this.li.textContent = name;
       this.listEl.appendChild(this.li);
     }
-
-    this.setColor(name ? hueFromName(name) : Math.random());
+    
+    if(!color) {
+      this.setColor(name ? hueFromName(name) : Math.random());
+    } else {
+      this.setForceColor(color);
+    }
     if (selection) { this.updateSelection(selection); }
   }
 
@@ -1624,6 +1778,13 @@ ot.EditorClient = (function () {
     this.hue = hue;
     this.color = hsl2hex(hue, 0.75, 0.5);
     this.lightColor = hsl2hex(hue, 0.5, 0.9);
+    if (this.li) { this.li.style.color = this.color; }
+  };
+    
+  OtherClient.prototype.setForceColor = function (color) {
+    this.hue = null;
+    this.color = color;
+    this.lightColor = color;
     if (this.li) { this.li.style.color = this.color; }
   };
 
@@ -1684,9 +1845,13 @@ ot.EditorClient = (function () {
     this.serverAdapter.registerCallbacks({
       client_left: function (clientId) { self.onClientLeft(clientId); },
       set_name: function (clientId, name) { self.getClientObject(clientId).setName(name); },
-      ack: function () { self.serverAck(); },
-      operation: function (operation) {
-        self.applyServer(TextOperation.fromJSON(operation));
+      set_color: function (clientId, color) { self.getClientObject(clientId).setForceColor(color); },
+      ack: function (revision) { self.serverAck(revision); },
+      operation: function (revision, operation) {
+        self.applyServer(revision, TextOperation.fromJSON(operation));
+      },
+      operations: function (head, operations) {
+        self.applyOperations(head, operations);
       },
       selection: function (clientId, selection) {
         if (selection) {
@@ -1736,6 +1901,7 @@ ot.EditorClient = (function () {
       this.clientListEl,
       this.editorAdapter,
       clientObj.name || clientId,
+      clientObj.color || null,
       clientObj.selection ? Selection.fromJSON(clientObj.selection) : null
     );
   };
@@ -1760,7 +1926,6 @@ ot.EditorClient = (function () {
   };
 
   EditorClient.prototype.onClientLeft = function (clientId) {
-    console.log("User disconnected: " + clientId);
     var client = this.clients[clientId];
     if (!client) { return; }
     client.remove();
@@ -1827,6 +1992,10 @@ ot.EditorClient = (function () {
 
   EditorClient.prototype.sendOperation = function (revision, operation) {
     this.serverAdapter.sendOperation(revision, operation.toJSON(), this.selection);
+  };
+
+  EditorClient.prototype.getOperations = function (base, head) {
+    this.serverAdapter.getOperations(base, head);
   };
 
   EditorClient.prototype.applyOperation = function (operation) {

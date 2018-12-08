@@ -193,6 +193,24 @@
     ok(cmAdapter.getValue() === "nanananu");
   });
 
+  asyncTest("applyOperation should not ignore the next change if this change is a noop", function () {
+    var doc = "nanana";
+    var cm = CodeMirror(document.body, { value: doc });
+    var cmAdapter = new CodeMirrorAdapter(cm);
+    cmAdapter.registerCallbacks({
+      change: function () {
+        ok(true, "change function should be called!");
+        start();
+      }
+    });
+    // Apply noop
+    cmAdapter.applyOperation(new TextOperation().retain(5));
+    // Apply an actual change
+    CodeMirrorAdapter.applyOperationToCodeMirror(new TextOperation().retain(6).insert("nu"), cm);
+    ok(cm.getValue() === cmAdapter.getValue());
+    ok(cmAdapter.getValue() === "nanananu");
+  });
+
   test("getValue", function () {
     var doc = "guten tag";
     var cm = CodeMirror(document.body, { value: doc });
@@ -233,13 +251,11 @@
     var selection1 = new Selection([new Range(3,3), new Range(9,16)]);
     var handle1 = cmAdapter.setOtherSelection(selection1, '#ff0000', 'tim');
     deepEqual(cm.getAllMarks().map(function (x) { return x.find(); }), [
-      new CodeMirror.Pos(0, 3),
       { from: new CodeMirror.Pos(0, 9), to: new CodeMirror.Pos(1, 5) }
     ], "the codemirror instance should contain the other user's selection as marks");
     var selection2 = new Selection([new Range(4,6)]);
     var handle2 = cmAdapter.setOtherSelection(selection2, '#0000ff', 'tim');
     deepEqual(cm.getAllMarks().map(function (x) { return x.find(); }), [
-      new CodeMirror.Pos(0, 3),
       { from: new CodeMirror.Pos(0, 9), to: new CodeMirror.Pos(1, 5) },
       { from: new CodeMirror.Pos(0, 4), to: new CodeMirror.Pos(0, 6) }
     ], "the codemirror instance should contain the other users' selection as marks");
